@@ -127,3 +127,28 @@ async function runLotteryCycle() {
 console.log("Solana Roulette Bot initialized.");
 setInterval(runLotteryCycle, INTERVAL_MS);
 runLotteryCycle();
+
+// 1. Importar o pacote CORS (precisas de instalar: npm install cors)
+const express = require('express');
+const cors = require('cors');
+const app = express();
+
+// 2. Configurar o CORS para permitir que o Lovable aceda à API
+app.use(cors()); 
+app.use(express.json());
+
+// Exemplo de uma rota para o Lovable consumir
+app.get('/api/dados', (req, res) => {
+    res.json({ 
+        status: "online", 
+        mensagem: "API conectada com sucesso ao Lovable!" 
+    });
+});
+
+// 3. A AJUSTE DA PORTA (O segredo para a Cloud)
+// O Render/Railway vai enviar a porta correta através de process.env.PORT
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Servidor a correr na porta ${PORT}`);
+});

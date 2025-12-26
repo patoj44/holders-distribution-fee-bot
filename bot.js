@@ -3,62 +3,85 @@ const {
     Connection, PublicKey, Keypair, Transaction, SystemProgram, 
     sendAndConfirmTransaction, LAMPORTS_PER_SOL 
 } = require('@solana/web3.js');
-const { getOrCreateAssociatedTokenAccount } = require('@solana/spl-token');
 const axios = require('axios');
 const bs58 = require('bs58');
+const express = require('express');
+const cors = require('cors');
 
-// --- CONFIGURATION ---
+// --- CONFIGURAÇÃO ---
 const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${(process.env.HELIUS_API_KEY || "").trim()}`;
 const connection = new Connection(HELIUS_RPC, 'confirmed');
 
 const decodeBase58 = (typeof bs58.decode === 'function') ? bs58.decode : bs58.default.decode;
 const DEV_KEYPAIR = Keypair.fromSecretKey(decodeBase58(process.env.DEV_PRIVATE_KEY.trim()));
 const MINT_ADDRESS = new PublicKey(process.env.TOKEN_MINT.trim());
-const TEAM_WALLET = new PublicKey(process.env.TEAM_WALLET); // Substitua aqui
+const TEAM_WALLET = new PublicKey(process.env.TEAM_WALLET.trim());
 
-const INTERVAL_MS = 5 * 60 * 1000;
+const INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
+
+// --- ESTADO GLOBAL (O que o Frontend vai ler) ---
+let lotteryState = {
+    marketCap: 0,
+    nextDraw: new Date(Date.now() + INTERVAL_MS).toISOString(),
+    lastScenario: "A",
+    lastWinners: [],
+    buybackTotal: 0, // Acumulado de buybacks (exemplo)
+    poolSol: 0
+};
 
 /**
- * FETCH ALL HOLDERS (Beyond Largest Accounts)
+ * FETCH MARKET CAP (DexScreener)
+ */
+async function updateMarketCap() {
+    try {
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${MINT_ADDRESS.toBase58()}`;
+        const res = await axios.get(url);
+        if (res.data.pairs && res.data.pairs.length > 0) {
+            lotteryState.marketCap = parseFloat(res.data.pairs[0].fdv || 0);
+        }
+    } catch (err) {
+        console.error("[ERROR] DexScreener API failed:", err.message);
+    }
+}
+
+/**
+ * FETCH ALL HOLDERS
  */
 async function getAllHolders() {
-    console.log("[INFO] Fetching all token holders...");
+    console.log("[INFO] Fetching token holders...");
     try {
         const accounts = await connection.getProgramAccounts(
-            new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'), // SPL Token Program
+            new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
             {
                 filters: [
-                    { dataSize: 165 }, // Size of a token account
+                    { dataSize: 165 },
                     { memcmp: { offset: 0, bytes: MINT_ADDRESS.toBase58() } }
                 ]
             }
         );
-        // Map to get public keys of owners with balance > 0
-        return accounts.map(a => a.account.data.slice(32, 64)) // This is a simplified buffer extraction
-                       .map(b => new PublicKey(b));
+        // Extrai as PublicKeys dos donos das contas
+        return accounts.map(a => {
+            const data = Buffer.from(a.account.data);
+            return new PublicKey(data.slice(32, 64));
+        });
     } catch (err) {
-        console.error("[ERROR] Failed to fetch all holders:", err.message);
+        console.error("[ERROR] Failed to fetch holders:", err.message);
         return [];
     }
 }
 
 /**
- * JUPITER BUYBACK (SOL -> TOKEN)
+ * JUPITER BUYBACK (SIMULAÇÃO)
  */
 async function executeBuyback(solAmount) {
-    console.log(`[ACTION] Executing Buyback for ${solAmount / LAMPORTS_PER_SOL} SOL...`);
-    try {
-        // For MVP: We log the intent. In production, use Jupiter API /v6/quote and /v6/swap
-        console.log(`[SUCCESS] Buyback complete via Jupiter. Tokens added to treasury.`);
-        return true;
-    } catch (err) {
-        console.error("[ERROR] Buyback failed:", err.message);
-        return false;
-    }
+    const amountInSol = solAmount / LAMPORTS_PER_SOL;
+    console.log(`[ACTION] Buyback de ${amountInSol} SOL iniciado...`);
+    lotteryState.buybackTotal += amountInSol;
+    return true;
 }
 
 /**
- * SEND SOL (For Distributions)
+ * SEND SOL
  */
 async function sendSOL(toPubkey, amount) {
     try {
@@ -70,85 +93,109 @@ async function sendSOL(toPubkey, amount) {
             })
         );
         await sendAndConfirmTransaction(connection, tx, [DEV_KEYPAIR]);
-        console.log(`[PAYOUT] Sent ${amount / LAMPORTS_PER_SOL} SOL to ${toPubkey.toBase58()}`);
+        return true;
     } catch (err) {
-        console.error(`[ERROR] Failed to send SOL to ${toPubkey.toBase58()}:`, err.message);
+        console.error(`[ERROR] Payout failed for ${toPubkey.toBase58()}`);
+        return false;
     }
 }
 
 /**
- * MAIN LOTTERY ENGINE
+ * CICLO PRINCIPAL DA LOTERIA
  */
 async function runLotteryCycle() {
-    console.log(`\n--- CYCLE START: ${new Date().toISOString()} ---`);
+    console.log(`\n--- INICIANDO CICLO: ${new Date().toISOString()} ---`);
     
     try {
-        // 1. Claim Fees (Check available balance increase)
+        await updateMarketCap();
         const balance = await connection.getBalance(DEV_KEYPAIR.publicKey);
-        const feesToDistribute = balance * 0.5; // Example: use 50% of current wallet balance as "new fees"
-        
-       /* if (feesToDistribute < 0.001 * LAMPORTS_PER_SOL) {
-            console.log("[SKIP] Fees too low for distribution.");
+        lotteryState.poolSol = balance / LAMPORTS_PER_SOL;
+
+        // Se o saldo for muito baixo, apenas atualizamos o timer e pulamos
+        /*if (balance < 0.01 * LAMPORTS_PER_SOL) {
+            console.log("[SKIP] Saldo insuficiente para distribuição.");
+            lotteryState.nextDraw = new Date(Date.now() + INTERVAL_MS).toISOString();
             return;
         }*/
 
-        // 2. Spin the Roulette
+        const feesToDistribute = balance * 0.9; // Deixa 10% para taxas de rede
         const roll = Math.floor(Math.random() * 100) + 1;
         const holders = await getAllHolders();
+        let winnersThisCycle = [];
 
         if (roll <= 80) {
-            // SCENARIO A: 80% (50% Buyback / 50% 3 Holders)
-            console.log("[ROULETTE] Scenario A Selected (80% chance)");
-            await executeBuyback(feesToDistribute * 0.5);
+            // CENÁRIO A: 80% (50% Buyback / 50% para 3 Holders)
+            lotteryState.lastScenario = "A";
+            const prizePool = feesToDistribute * 0.5;
+            await executeBuyback(prizePool);
             
-            const winners = holders.sort(() => 0.5 - Math.random()).slice(0, 3);
-            const prizePerWinner = (feesToDistribute * 0.5) / 3;
-            for (const winner of winners) await sendSOL(winner, prizePerWinner);
+            const shuffled = holders.sort(() => 0.5 - Math.random());
+            const luckyThree = shuffled.slice(0, 3);
+            const prizePerWinner = prizePool / 3;
+
+            for (const winner of luckyThree) {
+                const success = await sendSOL(winner, prizePerWinner);
+                if (success) {
+                    winnersThisCycle.push({ 
+                        address: winner.toBase58(), 
+                        amount: prizePerWinner / LAMPORTS_PER_SOL, 
+                        type: "SOL" 
+                    });
+                }
+            }
 
         } else if (roll <= 90) {
-            // SCENARIO B: 10% (100% to 1 Holder)
-            console.log("[ROULETTE] Scenario B: JACKPOT! (10% chance)");
+            // CENÁRIO B: 10% (JACKPOT - 100% para 1 Holder)
+            lotteryState.lastScenario = "B";
             const luckyWinner = holders[Math.floor(Math.random() * holders.length)];
-            await sendSOL(luckyWinner, feesToDistribute);
+            const success = await sendSOL(luckyWinner, feesToDistribute);
+            if (success) {
+                winnersThisCycle.push({ 
+                    address: luckyWinner.toBase58(), 
+                    amount: feesToDistribute / LAMPORTS_PER_SOL, 
+                    type: "SOL" 
+                });
+            }
 
         } else {
-            // SCENARIO C: 10% (100% Team Wallet)
-            console.log("[ROULETTE] Scenario C: Team Wallet (10% chance)");
+            // CENÁRIO C: 10% (Manutenção - Team Wallet)
+            lotteryState.lastScenario = "C";
             await sendSOL(TEAM_WALLET, feesToDistribute);
+            winnersThisCycle.push({ 
+                address: "TEAM_WALLET", 
+                amount: feesToDistribute / LAMPORTS_PER_SOL, 
+                type: "SOL" 
+            });
         }
 
+        // Atualiza o estado para o Lovable ler
+        lotteryState.lastWinners = winnersThisCycle;
+        lotteryState.nextDraw = new Date(Date.now() + INTERVAL_MS).toISOString();
+
     } catch (err) {
-        console.error("[CRITICAL] Cycle failed:", err);
+        console.error("[CRITICAL] Erro no ciclo:", err);
     }
-    console.log(`--- CYCLE END: Waiting ${INTERVAL_MS/60000} mins ---\n`);
+    console.log(`--- FIM DO CICLO. Próximo em: ${lotteryState.nextDraw} ---`);
 }
 
-// Start
-console.log("Solana Roulette Bot initialized.");
-setInterval(runLotteryCycle, INTERVAL_MS);
-runLotteryCycle();
-
-// 1. Importar o pacote CORS (precisas de instalar: npm install cors)
-const express = require('express');
-const cors = require('cors');
+// --- SERVIDOR EXPRESS PARA O LOVABLE ---
 const app = express();
-
-// 2. Configurar o CORS para permitir que o Lovable aceda à API
-app.use(cors()); 
+app.use(cors());
 app.use(express.json());
 
-// Exemplo de uma rota para o Lovable consumir
-app.get('/api/dados', (req, res) => {
-    res.json({ 
-        status: "online", 
-        mensagem: "API conectada com sucesso ao Lovable!" 
-    });
+// Rota principal que o Lovable vai chamar
+app.get('/api/lottery', (req, res) => {
+    res.json(lotteryState);
 });
 
-// 3. A AJUSTE DA PORTA (O segredo para a Cloud)
-// O Render/Railway vai enviar a porta correta através de process.env.PORT
+// Health check
+app.get('/', (req, res) => res.send("Lottery Bot Online"));
+
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor a correr na porta ${PORT}`);
+    console.log(`🚀 API da Loteria rodando na porta ${PORT}`);
 });
+
+// Inicialização
+setInterval(runLotteryCycle, INTERVAL_MS);
+runLotteryCycle(); // Executa o primeiro imediatamente

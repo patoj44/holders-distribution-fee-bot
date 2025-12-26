@@ -1,1 +1,3 @@
-﻿# holders-distribution-fee-bot
+﻿# Redistribution fee bot on Solana
+
+# Each 10 np

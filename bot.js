@@ -21,6 +21,8 @@ const INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
 
 // --- ESTADO GLOBAL (O que o Frontend vai ler) ---
 let lotteryState = {
+    tokenSymbol: '',
+    tokenAdress: 'TOKEN_MINT',
     marketCap: 0,
     nextDraw: new Date(Date.now() + INTERVAL_MS).toISOString(),
     lastScenario: "A",
@@ -30,14 +32,20 @@ let lotteryState = {
 };
 
 /**
- * FETCH MARKET CAP (DexScreener)
+ * FETCH MARKET CAP & TOKEN INFO (DexScreener)
  */
 async function updateMarketCap() {
     try {
         const url = `https://api.dexscreener.com/latest/dex/tokens/${MINT_ADDRESS.toBase58()}`;
         const res = await axios.get(url);
         if (res.data.pairs && res.data.pairs.length > 0) {
-            lotteryState.marketCap = parseFloat(res.data.pairs[0].fdv || 0);
+            const pair = res.data.pairs[0];
+            
+            // Atualiza os dados no estado global
+            lotteryState.marketCap = parseFloat(pair.fdv || 0);
+            lotteryState.tokenSymbol = pair.baseToken.symbol; 
+            
+            console.log(`[DATA] Token: ${pair.baseToken.symbol} | MC: $${lotteryState.marketCap}`);
         }
     } catch (err) {
         console.error("[ERROR] DexScreener API failed:", err.message);
@@ -112,11 +120,11 @@ async function runLotteryCycle() {
         lotteryState.poolSol = balance / LAMPORTS_PER_SOL;
 
         // Se o saldo for muito baixo, apenas atualizamos o timer e pulamos
-        /*if (balance < 0.01 * LAMPORTS_PER_SOL) {
+        if (balance < 0.01 * LAMPORTS_PER_SOL) {
             console.log("[SKIP] Saldo insuficiente para distribuição.");
             lotteryState.nextDraw = new Date(Date.now() + INTERVAL_MS).toISOString();
             return;
-        }*/
+        }
 
         const feesToDistribute = balance * 0.9; // Deixa 10% para taxas de rede
         const roll = Math.floor(Math.random() * 100) + 1;

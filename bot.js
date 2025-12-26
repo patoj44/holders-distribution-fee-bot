@@ -22,7 +22,7 @@ const INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
 // --- ESTADO GLOBAL (O que o Frontend vai ler) ---
 let lotteryState = {
     tokenSymbol: '',
-    tokenAdress: 'TOKEN_MINT',
+    tokenAdress: process.env.TOKEN_MINT,
     marketCap: 0,
     nextDraw: new Date(Date.now() + INTERVAL_MS).toISOString(),
     lastScenario: "A",
@@ -31,24 +31,27 @@ let lotteryState = {
     poolSol: 0
 };
 
-/**
- * FETCH MARKET CAP & TOKEN INFO (DexScreener)
- */
 async function updateMarketCap() {
     try {
         const url = `https://api.dexscreener.com/latest/dex/tokens/${MINT_ADDRESS.toBase58()}`;
-        const res = await axios.get(url);
+        const res = await axios.get(url, { timeout: 5000 });
+
         if (res.data.pairs && res.data.pairs.length > 0) {
             const pair = res.data.pairs[0];
             
-            // Atualiza os dados no estado global
-            lotteryState.marketCap = parseFloat(pair.fdv || 0);
-            lotteryState.tokenSymbol = pair.baseToken.symbol; 
+            // Atualiza o estado global
+            lotteryState.marketCap = parseFloat(pair.fdv || lotteryState.marketCap);
+            lotteryState.tokenSymbol = pair.baseToken.symbol || lotteryState.tokenSymbol;
             
-            console.log(`[DATA] Token: ${pair.baseToken.symbol} | MC: $${lotteryState.marketCap}`);
+            console.log(`[LIVE-MC] $${lotteryState.tokenSymbol}: $${lotteryState.marketCap.toLocaleString()}`);
         }
     } catch (err) {
-        console.error("[ERROR] DexScreener API failed:", err.message);
+        if (err.response && err.response.status === 429) {
+            // Se der erro 429, apenas ignoramos silenciosamente para não poluir o log
+            // O valor antigo continua no JSON para o Lovable ler
+        } else {
+            console.error("[ERROR MC]:", err.message);
+        }
     }
 }
 
@@ -204,6 +207,19 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 API da Loteria rodando na porta ${PORT}`);
 });
 
-// Inicialização
+// --- INICIALIZAÇÃO E TIMERS ---
+
+const MC_UPDATE_INTERVAL = 30 * 1000; // 30 segundos
+
+// 1. Atualiza o Market Cap a cada 30 segundos
+setInterval(updateMarketCap, MC_UPDATE_INTERVAL);
+
+// 2. Executa o ciclo da Loteria (pagamentos) a cada 5 minutos
 setInterval(runLotteryCycle, INTERVAL_MS);
-runLotteryCycle(); // Executa o primeiro imediatamente
+
+// 3. Execução imediata ao ligar o bot
+setTimeout(async () => {
+    console.log("Iniciando serviços...");
+    await updateMarketCap(); // Pega o preço logo de cara
+    runLotteryCycle();       // Roda o primeiro sorteio
+}, 5000);
